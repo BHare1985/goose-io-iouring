@@ -1,7 +1,7 @@
 # goose-io-iouring
 
 The io_uring event loop for [goose-io](https://github.com/BHare1985/goose-io), on real sockets, Linux only (5.1 or newer; liburing). One `iouring::Loop` is one thread's event loop. It supplies the
-goose-io contract's core and the half-close, sizing, abort, inspection, batching and name-resolution capabilities (not unix, relay, peek, revoke, wake or limits), and passes the conformance suite
+goose-io contract's core and the half-close, sizing, abort, inspection, batching, shared-listen and name-resolution capabilities (not unix, relay, peek, revoke, wake or limits), and passes the conformance suite
 on them. It is [goose-io-epoll](https://github.com/BHare1985/goose-io-epoll) with the kernel interface changed and one capability added:
 
 - **io_uring, as readiness.** Each watched socket has one single-shot `IORING_OP_POLL_ADD` in flight; a completion is one event, and the

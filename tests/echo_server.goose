@@ -54,7 +54,10 @@ thread_fn worker(index: i64) {
     var io = iouring::Loop { .. };
     io.limits = limits;
     var e = echo::Echo { .. };
-    if !e.start(io, address[..]) {
+    // the workers share one port (the shared-listen capability), so the library's plain `start` is not used
+    let l, lerr = io.listen_shared(address[..]);
+    e.listener = l;
+    if !goose_io::is_listener(l) || goose_io::failed(lerr) {
         print("cannot listen on ", address);
         iouring::report_failed_start();
         return;

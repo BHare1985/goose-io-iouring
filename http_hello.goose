@@ -43,7 +43,7 @@ var address: u8[>..] = [];
 thread_fn worker(index: i64) {
     var sessions = goose_io::LinkMap<Session> { .. };
     var io = iouring::Loop { .. };
-    let listener, err = io.listen(address[..]);
+    let listener, err = io.listen_shared(address[..]);
     if goose_io::failed(err) {
         var msg: u8[>..] = [];
         iouring::describe_listen_failure(address[..], err, msg);

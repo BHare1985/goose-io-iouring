@@ -30,7 +30,9 @@ thread_fn worker(index: i64) {
     goose_io::require_core(io);
     goose_io::require_half_close(io);
     var server = lineserver::LineServer { .. };
-    if !server.start(io, address[..]) { print("cannot listen"); iouring::report_failed_start(); return; }
+    let l, lerr = io.listen_shared(address[..]);
+    server.listener = l;
+    if !goose_io::is_listener(l) || goose_io::failed(lerr) { print("cannot listen"); iouring::report_failed_start(); return; }
     io.attach(index);
     io.serve() { io, ev =>
         server.server_event(io, ev);

@@ -16,6 +16,7 @@ fn main() {
     assert(supplied(goose_io::has_abort(io)));
     assert(supplied(goose_io::has_inspection(io)));
     assert(supplied(goose_io::has_batching(io)));
+    assert(supplied(goose_io::has_shared_listen(io)));
     assert(supplied(goose_io::has_name_resolution(io)));
     assert(!supplied(goose_io::has_unix(io)));
     assert(!supplied(goose_io::has_relay(io)));
@@ -23,5 +24,5 @@ fn main() {
     assert(!supplied(goose_io::has_revoke(io)));
     assert(!supplied(goose_io::has_wake(io)));
     assert(!supplied(goose_io::has_limits(io)));
-    print("capabilities: 6 supplied, 6 absent");
+    print("capabilities: 7 supplied, 6 absent");
 }

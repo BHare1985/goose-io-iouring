@@ -88,11 +88,13 @@ fn main() {
     goose_io::require_abort(io);
     goose_io::require_inspection(io);
     goose_io::require_name_resolution(io);
+    goose_io::require_shared_listen(io);
     let fixture = goose_io_conformance::Fixture { silent: texts[..silent_end], held: texts[silent_end..held_end], refused: texts[answers_end..], answers: texts[held_end..answers_end], unix: "", found: "localhost", missing: "no-such-name.invalid", pair: pair_name[..], pair_first: pair_first[..], pair_second: pair_second[..] };
     if capability == "half-close" { exit(goose_io_conformance::conformance_half_close_part(io, fixture, part)); }
     if capability == "sizing" { exit(goose_io_conformance::conformance_sizing_part(io, fixture, part)); }
     if capability == "abort" { exit(goose_io_conformance::conformance_abort_part(io, fixture, part)); }
     if capability == "inspection" { exit(goose_io_conformance::conformance_inspection_part(io, fixture, part)); }
+    if capability == "shared-listen" { exit(goose_io_conformance::conformance_shared_listen_part(io, fixture, part)); }
     if capability == "name-resolution" { exit(goose_io_conformance::conformance_name_resolution_part(io, fixture, part)); }
     if capability == "batching" { exit(goose_io_conformance::conformance_batching_part(io, fixture, part)); }
     exit(goose_io_conformance::conformance_core_part(io, fixture, part));
