@@ -1,0 +1,4 @@
+// The native part of the io_uring event loop: one C file, compiled by Goose's own C driver, linked with liburing.
+c_sources = ["src/sys.c"];
+c_libs = ["uring"];
+exclude = ["tests"];
