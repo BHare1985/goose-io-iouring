@@ -9,7 +9,7 @@
 //
 // How it works, in one paragraph. A link lives in a slot with a generation; every socket is registered with the ring (a poll op per descriptor, re-armed each wait: level-triggered)
 // and the completion data names the slot and its generation, so an event for a link that has ended is
-// recognised and ignored. Events are never delivered from inside epoll dispatch or from an operation: dispatch and the
+// recognised and ignored. Events are never delivered from inside ring dispatch or from an operation: dispatch and the
 // operations append flat records to a queue, and `serve` drains the queue after the dispatch, calling the application's
 // block once per record. A `Data` record keeps its pool buffer until the block returns. A slot is freed only after
 // its `Closed` has been handled (contract: tcprouter freed it when the `Closed` was queued).
@@ -43,7 +43,7 @@ let _EVENT_KIND_RESOLVER: u64 = 5;    // the pipe a finished name lookup announc
 let _WAITER_READER:       u64 = 1;    // in the low byte of a _waiting_reads entry: a read waits for a pool buffer
 let _WAITER_WRITER:       u64 = 2;    // a refused send waits for a pool buffer
 
-let _MAX_GEN: u32 = 0xffffff;         // a generation is 24 bits in the epoll data; a slot whose generations are used up is retired
+let _MAX_GEN: u32 = 0xffffff;         // a generation is 24 bits in the completion data; a slot whose generations are used up is retired
 
 let _PENDING_OPENED:   u8 = 1;
 let _PENDING_DATA:     u8 = 2;
@@ -90,8 +90,8 @@ struct _Link {
     gen:               u32,
     state:             u8,
     fd:                i32,
-    mask:              u32,      // the epoll interest set now
-    registered:        bool,     // the descriptor is in epoll
+    mask:              u32,      // the interest set now
+    registered:        bool,     // the descriptor is watched by the ring
     listener:          u32,      // the listener that accepted it, 0 for a dialled link
     started_ms:        i64,      // when the link was accepted, or the dial began (the dial's timeout)
     last_active_ms:    i64,      // when bytes last moved in either direction (idle and half-close timeouts)
@@ -150,7 +150,7 @@ struct _Pending {
 struct _Listening {
     fd:        i32,
     active:    bool,
-    resume_at: i64,              // boottime ms when a paused listener goes back into epoll, or 0
+    resume_at: i64,              // boottime ms when a paused listener goes back on the ring, or 0
 }
 
 // A socket whose link has ended with Closed(Local) after `close` finished sending. Closing it at once could reset the connection if input
@@ -164,7 +164,7 @@ struct _Orphan {
 root struct Loop {
     limits:              Limits          = Limits { .. }, // set before the first listen, dial or serve
     index:               i64             = 0,             // which of several loops this is (see attach)
-    _epoll_fd:           i32             = -1,
+    _ring_fd:            i32             = -1,
     _started:            bool            = false,
     _stats:              Stats           = Stats { .. },
     _links:              _Link[>..]      = [], // one per link, reused through _free_links
@@ -206,15 +206,15 @@ fn _pack_event_data(kind: u64, slot: i64, gen: u32) -> u64 {
 
 fn _pause_milliseconds(ms: i64) { sleep_ms(ms); }
 
-// The first operation (or serve) creates the epoll instance. False when the system has none to give.
+// The first operation (or serve) creates the ring. False when the system has none to give.
 fn _ensure(io: Loop&) -> bool {
-    if io._started { return io._epoll_fd >= 0; }
+    if io._started { return io._ring_fd >= 0; }
     io._started = true;
     io._now_ms = c_boottime_ms();
     if io.limits.buffer_size < 1024 { io.limits.buffer_size = 1024; }            // max_send is four buffers: at least 4096
     if io.limits.buffers_per_loop < 4 { io.limits.buffers_per_loop = 4; }
-    io._epoll_fd = c_epoll_create();
-    io._epoll_fd >= 0
+    io._ring_fd = c_ring_create();
+    io._ring_fd >= 0
 }
 
 fn _failed_with(kind: goose_io::ConnectFailure) -> goose_io::CloseReason {
@@ -361,7 +361,7 @@ fn _fresh_link(io: Loop&, fd: i32, listener: u32, state: u8) -> i64 {
     i
 }
 
-// --- epoll interest ------------------------------------------------------------------------------
+// --- ring interest ------------------------------------------------------------------------------
 
 fn _wants_read(s: _Link&) -> bool {
     !s.closing && !s.paused && !s.eof_seen && !s.waiting
@@ -371,11 +371,11 @@ fn _set_interest(io: Loop&, i: i64, mask: u32) {
     let s .= io._links[i];
     if s.registered {
         if mask == s.mask { return; }
-        c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_MOD, s.fd, mask, _pack_event_data(_EVENT_KIND_LINK, i, s.gen));
+        c_ring_ctl(io._ring_fd, c_WATCH_MOD, s.fd, mask, _pack_event_data(_EVENT_KIND_LINK, i, s.gen));
     } else {
         if mask == 0 { return; }
-        let rc = c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_ADD, s.fd, mask, _pack_event_data(_EVENT_KIND_LINK, i, s.gen));
-        if rc < 0 { return; }                               // out of epoll memory: like a failed MOD, the idle timeout ends it
+        let rc = c_ring_ctl(io._ring_fd, c_WATCH_ADD, s.fd, mask, _pack_event_data(_EVENT_KIND_LINK, i, s.gen));
+        if rc < 0 { return; }                               // out of ring memory: like a failed MOD, the idle timeout ends it
         s.registered = true;
     }
     s.mask = mask;
@@ -385,10 +385,10 @@ fn _update_interest(io: Loop&, i: i64) {
     let s .= io._links[i];
     if s.state != _OPEN { return; }
     var m: u32 = 0;
-    // A pending Data record does not clear EPOLLIN: serve handles every queued record before the next epoll_wait, and
-    // _read_link will not read while one is pending, so the mask change (an epoll_ctl per request, twice) would be for nothing.
-    if s._wants_read() { m |= c_EPOLLIN; }
-    if s.out_count > 0 { m |= c_EPOLLOUT; }
+    // A pending Data record does not clear POLLIN: serve handles every queued record before the next ring wait, and
+    // _read_link will not read while one is pending, so the mask change (a watch change per request, twice) would be for nothing.
+    if s._wants_read() { m |= c_POLLIN; }
+    if s.out_count > 0 { m |= c_POLLOUT; }
     io._set_interest(i, m);
 }
 
@@ -463,7 +463,7 @@ fn listen(io: Loop&, address: const u8[:]) -> goose_io::Listener, goose_io::List
     let fd = c_listen(p.v6, p.ip, p.port, true, 1024);
     if fd < 0 { return none, goose_io::ListenError { kind: _listen_kind(-fd), code: -fd }; }
     let index = io._listeners.len;
-    if c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_ADD, fd, c_EPOLLIN, _pack_event_data(_EVENT_KIND_LISTENER, index, 0)) < 0 {
+    if c_ring_ctl(io._ring_fd, c_WATCH_ADD, fd, c_POLLIN, _pack_event_data(_EVENT_KIND_LISTENER, index, 0)) < 0 {
         c_close(fd);
         return none, goose_io::ListenError { kind: goose_io::ListenErrorKind.NoResources, code: 24 };
     }
@@ -483,7 +483,7 @@ fn listener_port(io: Loop&, l: goose_io::Listener) -> u16 {
     if port < 0 { 0 } else { port as u16 }
 }
 
-// Closes the listener's socket and takes it out of epoll; links it accepted stay. Its id is not issued again.
+// Closes the listener's socket and takes it off the ring; links it accepted stay. Its id is not issued again.
 fn stop_listening(io: Loop&, l: goose_io::Listener) {
     if io._finished { return; }
     let k = io._listener_index(l);
@@ -505,23 +505,23 @@ fn _accept_ready(io: Loop&, k: i64) {
         let error = -fd;
         if error == c_EAGAIN || error == c_EINTR { return; }              // nobody is waiting
         if error == c_ECONNABORTED || error == c_EPROTO { continue; }     // that client left
-        // Out of descriptors, memory or socket buffers (EMFILE, ENFILE, ENOMEM, ENOBUFS...): nothing we do right now can fix it, and epoll is
-        // level-triggered, so the pending connection would wake us again at once and we would spin. Leave this listener out of epoll for a
+        // Out of descriptors, memory or socket buffers (EMFILE, ENFILE, ENOMEM, ENOBUFS...): nothing we do right now can fix it, and the poll is
+        // level-triggered, so the pending connection would wake us again at once and we would spin. Leave this listener off the ring for a
         // moment; the clients wait in the kernel's backlog and are served when descriptors come back.
         io._stats.accept_failures++;
-        c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_MOD, io._listeners[k].fd, 0, _pack_event_data(_EVENT_KIND_LISTENER, k, 0));
+        c_ring_ctl(io._ring_fd, c_WATCH_MOD, io._listeners[k].fd, 0, _pack_event_data(_EVENT_KIND_LISTENER, k, 0));
         io._listeners[k].resume_at = c_boottime_ms() + _ACCEPT_PAUSE_MILLISECONDS;
         return;
     }
 }
 
-// Puts back into epoll the listeners whose pause is over. Called once per pass of the loop.
+// Puts back on the ring the listeners whose pause is over. Called once per pass of the loop.
 fn _resume_paused_listeners(io: Loop&, now: i64) {
     for k in io._listeners.len {
         let lst .= io._listeners[k];
         if lst.resume_at != 0 && now >= lst.resume_at {
             lst.resume_at = 0;
-            if lst.fd >= 0 { c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_MOD, lst.fd, c_EPOLLIN, _pack_event_data(_EVENT_KIND_LISTENER, k, 0)); }
+            if lst.fd >= 0 { c_ring_ctl(io._ring_fd, c_WATCH_MOD, lst.fd, c_POLLIN, _pack_event_data(_EVENT_KIND_LISTENER, k, 0)); }
         }
     }
 }
@@ -565,8 +565,8 @@ fn dial(io: Loop&, address: const u8[:], connect_ms: i64) -> goose_io::Link {
         return link;
     }
     s.fd = fd;
-    s.mask = c_EPOLLOUT;                              // level-triggered: the connect finishing makes the socket writable (or errored)
-    if c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_ADD, fd, c_EPOLLOUT, _pack_event_data(_EVENT_KIND_LINK, i, s.gen)) < 0 {
+    s.mask = c_POLLOUT;                              // level-triggered: the connect finishing makes the socket writable (or errored)
+    if c_ring_ctl(io._ring_fd, c_WATCH_ADD, fd, c_POLLOUT, _pack_event_data(_EVENT_KIND_LINK, i, s.gen)) < 0 {
         io._stats.connect_failures++;
         io._end(i, _failed_with(goose_io::ConnectFailure.NoResources));
         return link;
@@ -815,7 +815,7 @@ fn _adopt_orphan(io: Loop&, fd: i32) {
     var k: i64 = -1;
     for j in io._orphans.len { if io._orphans[j].fd < 0 { k = j; break; } }
     if k < 0 { k = io._orphans.len; io._orphans.push(_Orphan { fd: -1, since_ms: 0 }); }
-    if c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_MOD, fd, c_EPOLLIN, _pack_event_data(_EVENT_KIND_ORPHAN, k, 0)) < 0 { c_close(fd); return; }
+    if c_ring_ctl(io._ring_fd, c_WATCH_MOD, fd, c_POLLIN, _pack_event_data(_EVENT_KIND_ORPHAN, k, 0)) < 0 { c_close(fd); return; }
     io._orphans[k] = _Orphan { fd: fd, since_ms: io._now_ms };
     io._orphans_open++;
 }
@@ -941,7 +941,7 @@ fn resolve(io: Loop&, host: const u8[:], port: i64, timeout_ms: i64) -> goose_io
     if io._resolver_fd < 0 {
         io._resolver_fd = c_resolve_open();
         if io._resolver_fd < 0 { return goose_io::Query {}; }
-        c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_ADD, io._resolver_fd, c_EPOLLIN, _pack_event_data(_EVENT_KIND_RESOLVER, 0, 0));
+        c_ring_ctl(io._ring_fd, c_WATCH_ADD, io._resolver_fd, c_POLLIN, _pack_event_data(_EVENT_KIND_RESOLVER, 0, 0));
     }
     let id = io._next_query;
     if c_resolve_start(io._resolver_fd, id, host[0], host.len, port as u16) < 0 { return goose_io::Query {}; }
@@ -1058,10 +1058,10 @@ fn _enforce_stop(io: Loop&) {
 }
 
 // A Tick comes at least every 100 ms of the loop's clock; the loop aims at 90 so that the scheduler's slack and the
-// millisecond rounding of epoll_wait cannot make a gap longer than 100.
+// millisecond rounding of the ring wait cannot make a gap longer than 100.
 let _TICK_PERIOD_MS: i64 = 90;
 
-// How long epoll_wait may sleep: until the next Tick, or less when a dial's connect deadline or a time asked for with tick_by comes sooner.
+// How long the ring wait may sleep: until the next Tick, or less when a dial's connect deadline or a time asked for with tick_by comes sooner.
 fn _wait_limit(io: Loop&, last_tick: i64) -> i32 {
     let now = c_boottime_ms();
     var limit: i64 = last_tick + _TICK_PERIOD_MS - now;
@@ -1225,13 +1225,13 @@ fn _dispatch_event(io: Loop&, data: u64, events: u32) {
     if s.state == _FREE || s.gen != gen { io._stats.stale_events++; return; }     // an event for a link that has ended (and maybe whose slot is reused)
     if s.state == _ENDED { return; }                                 // Closed is queued: the descriptor is closed when it has been handled
     if s.state == _DIALING { io._dial_finished(slot); return; }      // success, refusal or error: the socket says which
-    if (events & c_EPOLLERR) != 0 { io._end(slot, goose_io::CloseReason.PeerReset); return; }
-    if (events & c_EPOLLOUT) != 0 {
+    if (events & c_POLLERR) != 0 { io._end(slot, goose_io::CloseReason.PeerReset); return; }
+    if (events & c_POLLOUT) != 0 {
         io._flush_output(slot);
         if s.state != _OPEN { return; }
     }
-    if (events & (c_EPOLLIN | c_EPOLLHUP)) != 0 {
-        if (events & c_EPOLLIN) == 0 && !s._wants_read() { io._end(slot, goose_io::CloseReason.PeerReset); return; }
+    if (events & (c_POLLIN | c_POLLHUP)) != 0 {
+        if (events & c_POLLIN) == 0 && !s._wants_read() { io._end(slot, goose_io::CloseReason.PeerReset); return; }
         io._read_link(slot);
     }
 }
@@ -1242,7 +1242,7 @@ fn _dispatch_event(io: Loop&, data: u64, events: u32) {
 // appends what arrived to `events`; returns how many it appended. Off (both limits 0) it returns at once and costs nothing.
 // It never waits past a deadline (the next Tick, the next sweep, a tick_by time, a dial's deadline, a paused listener's resume),
 // is not entered while draining, waits on the loop's message pipe so a posted message ends it at once, and reads the clock again.
-fn _batch_window(io: Loop&, events: c_EpollEvent[256]&, n: i32, last_tick: i64, last_sweep: i64) -> i32 {
+fn _batch_window(io: Loop&, events: c_RingEvent[256]&, n: i32, last_tick: i64, last_sweep: i64) -> i32 {
     let min = io.limits.batch_min_events;
     var us = io.limits.batch_max_wait_us;
     if min <= 0 || us <= 0 || n >= min || n >= 256 || io._draining { return 0; }
@@ -1259,7 +1259,7 @@ fn _batch_window(io: Loop&, events: c_EpollEvent[256]&, n: i32, last_tick: i64, 
     let slept = c_wait_readable_us(io._message_fd, us);
     io._stats.batch_waits++;
     if slept > 0 { io._stats.batch_wait_us += slept; }
-    let m = c_epoll_wait(io._epoll_fd, events[n], 256 - n, 0);        // everything that arrived meanwhile
+    let m = c_ring_wait(io._ring_fd, events[n], 256 - n, 0);        // everything that arrived meanwhile
     io._now_ms = c_boottime_ms();
     if m > 0 { m } else { 0 }
 }
@@ -1272,19 +1272,19 @@ fn _batch_window(io: Loop&, events: c_EpollEvent[256]&, n: i32, last_tick: i64, 
 fn serve<F>(io: Loop&) {
     if io._finished { return; }
     if !io._ensure() { io._finished = true; return; }
-    var events:     c_EpollEvent[256] = [c_EpollEvent { 0, 0 }; 256];
-    var last_tick:  i64               = 0;
-    var last_sweep: i64               = 0;
+    var events:     c_RingEvent[256] = [c_RingEvent { 0, 0 }; 256];
+    var last_tick:  i64              = 0;
+    var last_sweep: i64              = 0;
     loop {
         // work left over (events queued by what was set up before serve, or by the last pass): do not sleep
         let wait_ms: i32 = if io._pending_head < io._pending.len { 0 } else { io._wait_limit(last_tick) };
-        var n = c_epoll_wait(io._epoll_fd, events[0], 256, wait_ms);
+        var n = c_ring_wait(io._ring_fd, events[0], 256, wait_ms);
         io._now_ms = c_boottime_ms();
         if n > 0 && wait_ms > 0 { n += io._batch_window(events, n, last_tick, last_sweep); }
         // Messages first, then events: a drain must not be outrun by traffic in the same pass.
         if n > 0 { for k in n { if (events[k].data & 0xff) == _EVENT_KIND_MESSAGE { io._read_messages(); } } }
         if n < 0 {
-            _pause_milliseconds(1);                     // an unexpected epoll error: do not spin
+            _pause_milliseconds(1);                     // an unexpected ring error: do not spin
         } else {
             for k in n { if (events[k].data & 0xff) != _EVENT_KIND_MESSAGE { io._dispatch_event(events[k].data, events[k].events); } }
         }
@@ -1324,8 +1324,8 @@ fn serve<F>(io: Loop&) {
         if io._listeners[k].fd >= 0 { c_close(io._listeners[k].fd); io._listeners[k].fd = -1; }
     }
     for k in io._orphans.len { if io._orphans[k].fd >= 0 { c_close(io._orphans[k].fd); io._orphans[k].fd = -1; } }
-    c_epoll_close(io._epoll_fd);
-    io._epoll_fd = -1;
+    c_ring_close(io._ring_fd);
+    io._ring_fd = -1;
     if io._resolver_fd >= 0 { c_resolve_close(io._resolver_fd); io._resolver_fd = -1; }
     if io._attached { qput(_DrainReport { drained: io._stats.closed[6] }); }
 }

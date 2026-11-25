@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The example gateway on the epoll event loop, against real peers: the line server and the line client on one worker, tagged
+"""The example gateway on the io_uring event loop, against real peers: the line server and the line client on one worker, tagged
 differently, each handling only its own events. A request to the front is answered with the reply the client fetched from the
 backend on the same worker."""
 import socket, time

@@ -5,7 +5,7 @@
 //
 // Goose's typed queues deliver a value to ONE receiver, so a broadcast needs an address per loop: each loop owns a pipe.
 // spawn() makes all of them before it starts any loop (globals set in main are copied into each thread at spawn), post()
-// writes one small flat record to every pipe, and a loop reads its own from epoll, before it handles the events of the same pass.
+// writes one small flat record to every pipe, and a loop reads its own from the ring, before it handles the events of the same pass.
 namespace iouring;
 
 import std;
@@ -74,7 +74,7 @@ fn attach(io: Loop&, index: i64) {
     io.index = index;
     if index < _loop_count {
         io._message_fd = _message_read_fds[index];
-        c_epoll_ctl(io._epoll_fd, c_EPOLL_CTL_ADD, io._message_fd, c_EPOLLIN, _pack_event_data(_EVENT_KIND_MESSAGE, 0, 0));
+        c_ring_ctl(io._ring_fd, c_WATCH_ADD, io._message_fd, c_POLLIN, _pack_event_data(_EVENT_KIND_MESSAGE, 0, 0));
         io._attached = true;
     }
 }

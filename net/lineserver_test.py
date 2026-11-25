@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The example line server on the epoll event loop, against real peers: split requests, pipelined requests, a peer that
+"""The example line server on the io_uring event loop, against real peers: split requests, pipelined requests, a peer that
 half-closes, a peer that never reads, and a clean stop. The same scenarios run on the in-memory loop in tests/examples."""
 import socket, sys, time
 from netlib import *

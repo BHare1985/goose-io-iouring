@@ -4,17 +4,17 @@
 // src/sys.c arranges because errno is thread-local. (This is tcprouter's sys.goose, less what the proxy used.)
 namespace iouring;
 
-// struct epoll_event as the C layer fills it: packed, 12 bytes (checked there by _Static_assert).
-struct c_EpollEvent { events: u32, data: u64 }
+// the event record the C layer fills in: packed, 12 bytes (checked there by _Static_assert).
+struct c_RingEvent { events: u32, data: u64 }
 
-let c_EPOLLIN:       u32 = 0x001;
-let c_EPOLLOUT:      u32 = 0x004;
-let c_EPOLLERR:      u32 = 0x008;
-let c_EPOLLHUP:      u32 = 0x010;
-let c_EPOLLRDHUP:    u32 = 0x2000;
-let c_EPOLL_CTL_ADD: i32 = 1;
-let c_EPOLL_CTL_DEL: i32 = 2;
-let c_EPOLL_CTL_MOD: i32 = 3;
+let c_POLLIN:    u32 = 0x001;
+let c_POLLOUT:   u32 = 0x004;
+let c_POLLERR:   u32 = 0x008;
+let c_POLLHUP:   u32 = 0x010;
+let c_POLLRDHUP: u32 = 0x2000;
+let c_WATCH_ADD: i32 = 1;
+let c_WATCH_DEL: i32 = 2;
+let c_WATCH_MOD: i32 = 3;
 
 let c_EAGAIN:        i32 = 11;
 let c_EINTR:         i32 = 4;
@@ -33,10 +33,10 @@ let c_EHOSTUNREACH:  i32 = 113;
 let c_ETIMEDOUT:     i32 = 110;
 let c_EPROTO:        i32 = 71;
 
-extern fn c_epoll_create() -> i32;
-extern fn c_epoll_close(ep: i32);
-extern fn c_epoll_ctl(ep: i32, op: i32, fd: i32, events: u32, data: u64) -> i32;
-extern fn c_epoll_wait(ep: i32, out: c_EpollEvent&, max: i32, timeout_ms: i32) -> i32;
+extern fn c_ring_create() -> i32;
+extern fn c_ring_close(ep: i32);
+extern fn c_ring_ctl(ep: i32, op: i32, fd: i32, events: u32, data: u64) -> i32;
+extern fn c_ring_wait(ep: i32, out: c_RingEvent&, max: i32, timeout_ms: i32) -> i32;
 
 // Sockets. `ip` is 4 bytes (IPv4) or 16 (IPv6) in network order, `v6` says which.
 extern fn c_listen(v6: bool, ip: const u8[16]&, port: u16, reuseport: bool, backlog: i32) -> i32;

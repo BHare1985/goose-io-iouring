@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The example line client on the epoll event loop, against a real line-echo service that is restarted mid-run: requests are
+"""The example line client on the io_uring event loop, against a real line-echo service that is restarted mid-run: requests are
 answered while the service is up, fail or time out while it is down, and the client dials again after its backoff and is
 answered again. The same scenarios run on the in-memory loop in tests/examples."""
 import socket, subprocess, threading, time

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""http_hello.goose on the epoll event loop, behaving as tcprouter's http_hello does (the checks of its
+"""http_hello.goose on the io_uring event loop, behaving as tcprouter's http_hello does (the checks of its
 examples_test.py): every request is answered with the same response, a request may arrive in pieces, requests may be pipelined, a
 request head over 2 KB drops the connection, and a load of keep-alive requests from 100 clients gets no error."""
 import re, shutil, socket, subprocess, threading, time

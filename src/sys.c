@@ -30,18 +30,18 @@
 
 #include "goose.h"
 
-/* Must match `c_EpollEvent` in sys.goose: { events: u32, data: u64 }, packed. */
-typedef struct __attribute__((packed)) { uint32_t events; uint64_t data; } c_epoll_event;
-_Static_assert(sizeof(c_epoll_event) == 12, "c_epoll_event must be 12 bytes, as Goose lays out EpollEvent");
+/* Must match `c_RingEvent` in sys.goose: { events: u32, data: u64 }, packed. */
+typedef struct __attribute__((packed)) { uint32_t events; uint64_t data; } c_ring_event;
+_Static_assert(sizeof(c_ring_event) == 12, "c_ring_event must be 12 bytes, as Goose lays out RingEvent");
 
 #define C_MAX_EVENTS 256
 
 /* --- the ring ----------------------------------------------------------------------------------------
- * The loop asks for readiness, as the epoll loop does, but the kernel is asked through io_uring: every descriptor the
+ * The loop asks for readiness, as goose-io-epoll does, but the kernel is asked through io_uring: every descriptor the
  * loop watches has one single-shot IORING_OP_POLL_ADD in flight while its interest is not empty. A completion is one
  * event and disarms that poll; the next wait arms it again, so a descriptor that is still ready is reported again,
  * the level-triggered behaviour the engine is written for. Arming, re-arming, removing and the wait are submitted
- * together, in one io_uring_enter. The "epoll descriptor" the engine holds is the ring's own fd; per-ring state is
+ * together, in one io_uring_enter. The "ring descriptor" the engine holds is the ring's own fd; per-ring state is
  * found by it. A loop is one thread's, so c_close finds its ring through a thread-local pointer. */
 #include <liburing.h>
 #include <stdlib.h>
@@ -86,7 +86,7 @@ static void unarm(c_ring *r, int32_t fd) {      /* cancels the poll in flight fo
     w->armed = 0;
 }
 
-int32_t c_epoll_create(void) {
+int32_t c_ring_create(void) {
     c_ring *r = calloc(1, sizeof *r);
     if (!r) return -ENOMEM;
     int rc = io_uring_queue_init(C_RING_ENTRIES, &r->ring, 0);
@@ -98,8 +98,8 @@ int32_t c_epoll_create(void) {
     return fd;
 }
 
-/* The engine's c_epoll_ctl calls, with epoll's values for op (1 add, 2 delete, 3 modify) and for the event bits. */
-int32_t c_epoll_ctl(int32_t ep, int32_t op, int32_t fd, uint32_t events, uint64_t data) {
+/* The engine's c_ring_ctl calls, with the values of epoll for op (1 add, 2 delete, 3 modify) and for the event bits. */
+int32_t c_ring_ctl(int32_t ep, int32_t op, int32_t fd, uint32_t events, uint64_t data) {
     c_ring *r = ring_of(ep);
     if (!r || fd < 0) return -EBADF;
     if (fd >= r->cap) {
@@ -139,7 +139,7 @@ static void arm_dirty(c_ring *r) {
 }
 
 /* Returns the number of events written to `out` (at most `max` and C_MAX_EVENTS), 0 when interrupted, or -errno. */
-int32_t c_epoll_wait(int32_t ep, c_epoll_event *out, int32_t max, int32_t timeout_ms) {
+int32_t c_ring_wait(int32_t ep, c_ring_event *out, int32_t max, int32_t timeout_ms) {
     c_ring *r = ring_of(ep);
     if (!r) return -EBADF;
     if (max > C_MAX_EVENTS) max = C_MAX_EVENTS;
@@ -180,8 +180,8 @@ int32_t c_epoll_wait(int32_t ep, c_epoll_event *out, int32_t max, int32_t timeou
     return n;
 }
 
-/* Closes a ring made by c_epoll_create. */
-void c_epoll_close(int32_t ep) {
+/* Closes a ring made by c_ring_create. */
+void c_ring_close(int32_t ep) {
     c_ring *r = ring_of(ep);
     if (!r) return;
     c_rings[ep] = NULL;
@@ -270,7 +270,7 @@ int64_t c_send(int32_t fd, const uint8_t *buf, int64_t len) {
 }
 
 void c_shutdown_wr(int32_t fd) { shutdown(fd, SHUT_WR); }
-/* A poll in flight holds its file open, so the poll goes first: epoll forgets a descriptor when it is closed, a ring does not. */
+/* A poll in flight holds its file open, so the poll goes first: a ring, unlike epoll, does not forget a descriptor when it is closed. */
 void c_close(int32_t fd) {
     c_ring *r = c_current;
     if (r && fd >= 0 && fd < r->cap && r->w[fd].active) {
@@ -368,7 +368,7 @@ int32_t c_signal_wait(int32_t fd) {
 
 /* --- pipes (messages to workers) ---------------------------------------------------------------------- */
 
-/* A pipe, close-on-exec, whose READ end is non-blocking (a worker polls it from epoll); the write end blocks. 0 or -errno. */
+/* A pipe, close-on-exec, whose READ end is non-blocking (a worker polls it from the ring); the write end blocks. 0 or -errno. */
 int32_t c_pipe(int32_t *fds) {
     if (pipe2(fds, O_CLOEXEC) < 0) return -errno;
     return fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0 ? -errno : 0;
