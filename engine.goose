@@ -39,7 +39,6 @@ let _EVENT_KIND_LISTENER: u64 = 1;
 let _EVENT_KIND_LINK:     u64 = 2;
 let _EVENT_KIND_ORPHAN:   u64 = 3;    // a socket of a link that has ended, kept open to read and drop the peer's input (see _finish_close)
 let _EVENT_KIND_MESSAGE:  u64 = 4;
-let _EVENT_KIND_RESOLVER: u64 = 5;    // the pipe a finished name lookup announces itself on (see resolve)
 let _WAITER_READER:       u64 = 1;    // in the low byte of a _waiting_reads entry: a read waits for a pool buffer
 let _WAITER_WRITER:       u64 = 2;    // a refused send waits for a pool buffer
 
@@ -124,21 +123,6 @@ struct _Link {
     peer_family:       i32,      // 4 or 6 when `peer` holds one, else 0
 }
 
-// A name lookup (the name-resolution capability): running until its thread answers or its deadline passes, then ready until its Resolved is delivered.
-let _LOOKUP_FREE:    u8 = 0;
-let _LOOKUP_RUNNING: u8 = 1;
-let _LOOKUP_READY:   u8 = 2;
-
-struct _Lookup {
-    id:     u32,
-    state:  u8,
-    due_ms: i64,                                  // the loop's clock: when it ends TimedOut
-    status: goose_io::ResolveStatus,
-    count:  i64,
-    found:  u8[136],                              // 8 x (v6 flag, 16 bytes of ip), as the C layer leaves them
-    port:   u16,
-}
-
 struct _Pending {
     kind:     u8,
     slot:     u32,
@@ -190,12 +174,7 @@ root struct Loop {
     _dial_due:           i64             = 0,     // the earliest connect deadline among them (0 = none known)
     _wake_at:            i64             = 0,     // the earliest time asked for with tick_by, or 0
     _now_ms:             i64             = 0,     // CLOCK_BOOTTIME at the start of the current pass of the loop
-    _resolver_fd:        i32             = -1,    // the read end the C layer's lookup threads announce themselves on, -1 until the first resolve
-    _lookups:            _Lookup[>..]    = [],    // one per lookup, reused
     _next_query:         u32             = 1,
-    _lookups_open:       i64             = 0,     // lookups running or ready
-    _lookup_due:         i64             = 0,     // the earliest deadline among the running ones (0 = none known)
-    _resolving:          i64             = -1,    // the lookup whose Resolved is being handled: resolved_address answers only then
 }
 
 // --- small helpers -------------------------------------------------------------------------------
@@ -941,111 +920,6 @@ fn supplies_inspection(io: Loop&) -> goose_io::Supplied { return goose_io::Suppl
 fn supplies_batching(io: Loop&) -> goose_io::Supplied { return goose_io::Supplied {}; }
 fn supplies_shared_listen(io: Loop&) -> goose_io::Supplied { return goose_io::Supplied {}; }
 
-// The name-resolution capability (contract 0.5). Lookups run on threads (getaddrinfo, in the C layer); the loop enforces the timeout.
-fn supplies_name_resolution(io: Loop&) -> goose_io::Supplied { return goose_io::Supplied {}; }
-
-fn resolve(io: Loop&, host: const u8[:], port: i64, timeout_ms: i64) -> goose_io::Query {
-    if io._finished || host.len < 1 || host.len > 253 || port < 0 || port > 65535 || !io._ensure() { return goose_io::Query {}; }
-    if io._resolver_fd < 0 {
-        io._resolver_fd = c_resolve_open();
-        if io._resolver_fd < 0 { return goose_io::Query {}; }
-        c_ring_ctl(io._ring_fd, c_WATCH_ADD, io._resolver_fd, c_POLLIN, _pack_event_data(_EVENT_KIND_RESOLVER, 0, 0));
-    }
-    let id = io._next_query;
-    if c_resolve_start(io._resolver_fd, id, host[0], host.len, port as u16) < 0 { return goose_io::Query {}; }
-    io._next_query++;
-    let now = c_boottime_ms();
-    let wait = if timeout_ms > 0 { timeout_ms } else { io.limits.resolve_timeout_ms };
-    var k: i64 = -1;
-    for i in io._lookups.len { if io._lookups[i].state == _LOOKUP_FREE { k = i; break; } }
-    if k < 0 {
-        io._lookups.push(_Lookup { id: 0, state: _LOOKUP_FREE, due_ms: 0, status: goose_io::ResolveStatus.Failed, count: 0, found: [0; 136], port: 0 });
-        k = io._lookups.len - 1;
-    }
-    let l .= io._lookups[k];
-    l.id = id; l.state = _LOOKUP_RUNNING; l.due_ms = now + wait; l.count = 0; l.port = port as u16;
-    l.status = goose_io::ResolveStatus.Failed;
-    io._lookups_open++;
-    if io._lookup_due == 0 || l.due_ms < io._lookup_due { io._lookup_due = l.due_ms; }
-    goose_io::Query { id: id }
-}
-
-// Valid only while the Resolved of that query is being handled: the i-th address of the answer, else empty.
-fn resolved_address(io: Loop&, q: goose_io::Query, i: i64) -> goose_io::Address {
-    if io._resolving < 0 || io._lookups[io._resolving].id != q.id || i < 0 || i >= io._lookups[io._resolving].count { return goose_io::Address {}; }
-    let l .= io._lookups[io._resolving];
-    var ip: u8[16] = [0; 16];
-    let v6 = l.found[i * 17] != 0;
-    for b in 16 { ip[b] = l.found[i * 17 + 1 + b]; }
-    _format_address(v6, ip, l.port)
-}
-
-fn cancel_resolve(io: Loop&, q: goose_io::Query) {
-    if q.id == 0 { return; }
-    for i in io._lookups.len {
-        if io._lookups[i].id == q.id && io._lookups[i].state != _LOOKUP_FREE && io._resolving != i {
-            io._lookups[i].state = _LOOKUP_FREE;
-            io._lookups_open--;
-        }
-    }
-}
-
-// Takes what the lookup threads have finished; one that was cancelled or has timed out is not wanted and is dropped.
-fn _take_resolutions(io: Loop&) {
-    if io._resolver_fd < 0 { return; }
-    var out: u8[136] = [0; 136];
-    loop {
-        let v = c_resolve_take(io._resolver_fd, out);
-        if v < 0 { return; }
-        let id = (v >> 32) as u32;
-        for i in io._lookups.len {
-            let l .= io._lookups[i];
-            if l.id != id || l.state != _LOOKUP_RUNNING { continue; }
-            l.state = _LOOKUP_READY;
-            l.count = v & 0xffff;
-            l.found = out;
-            l.status = if (v & 0x10000) != 0 { goose_io::ResolveStatus.Failed }
-                       else if l.count > 0 { goose_io::ResolveStatus.Found } else { goose_io::ResolveStatus.NotFound };
-        }
-    }
-}
-
-fn _expire_lookups(io: Loop&, now: i64) {
-    if io._lookup_due == 0 { return; }
-    var next: i64 = 0;
-    for i in io._lookups.len {
-        let l .= io._lookups[i];
-        if l.state != _LOOKUP_RUNNING { continue; }
-        if l.due_ms <= now {
-            l.state = _LOOKUP_READY; l.status = goose_io::ResolveStatus.TimedOut; l.count = 0;
-        } else if next == 0 || l.due_ms < next { next = l.due_ms; }
-    }
-    io._lookup_due = next;
-}
-
-// One Resolved for each lookup that is ready, oldest slot first; resolved_address answers during the block and not after.
-fn _deliver_resolved<F>(io: Loop&) {
-    if io._lookups_open == 0 { return; }
-    for i in io._lookups.len {
-        if io._lookups[i].state != _LOOKUP_READY { continue; }
-        io._resolving = i;
-        let ev: goose_io::Event = goose_io::Event.Resolved { query: goose_io::Query { id: io._lookups[i].id }, status: io._lookups[i].status, count: io._lookups[i].count };
-        F(io, ev);
-        io._resolving = -1;
-        io._lookups[i].state = _LOOKUP_FREE;
-        io._lookups_open--;
-    }
-}
-
-// The loop is ending: a lookup still running ends Cancelled, before the last pass.
-fn _cancel_lookups(io: Loop&) {
-    for i in io._lookups.len {
-        let l .= io._lookups[i];
-        if l.state == _LOOKUP_RUNNING { l.state = _LOOKUP_READY; l.status = goose_io::ResolveStatus.Cancelled; l.count = 0; }
-    }
-    io._lookup_due = 0;
-}
-
 // A snapshot of this loop's counters. Call it on the loop's thread, e.g. from a Tick.
 fn stats(io: Loop&) -> Stats {
     var s = io._stats;
@@ -1076,7 +950,6 @@ fn _wait_limit(io: Loop&, last_tick: i64) -> i32 {
     if io._dialing > 0 && io._dial_due != 0 && io._dial_due - now < limit { limit = io._dial_due - now; }
     if io._wake_at != 0 && io._wake_at - now < limit { limit = io._wake_at - now; }
     if io._draining && io._drain_deadline_ms - now < limit { limit = io._drain_deadline_ms - now; }
-    if io._lookup_due != 0 && io._lookup_due - now < limit { limit = io._lookup_due - now; }
     if limit < 0 { 0 } else { limit as i32 }
 }
 
@@ -1226,7 +1099,6 @@ fn _dispatch_event(io: Loop&, data: u64, events: u32) {
         return;
     }
     if kind == _EVENT_KIND_ORPHAN { io._drain_orphan(slot); return; }
-    if kind == _EVENT_KIND_RESOLVER { io._take_resolutions(); return; }
     if kind != _EVENT_KIND_LINK { io._stats.bad_events++; return; }
     if slot >= io._links.len { io._stats.bad_events++; return; }
     let s .= io._links[slot];
@@ -1296,15 +1168,11 @@ fn serve<F>(io: Loop&) {
         } else {
             for k in n { if (events[k].data & 0xff) != _EVENT_KIND_MESSAGE { io._dispatch_event(events[k].data, events[k].events); } }
         }
-        io._expire_lookups(io._now_ms);
-        io._deliver_resolved(F);
         io._deliver(F);
         io._enforce_stop();
         io._deliver(F);
         let now = io._now_ms;
         if io._draining && io._live == 0 && io._pending_head >= io._pending.len {
-            io._cancel_lookups();
-            io._deliver_resolved(F);
             io._deliver(F);
             if io._live == 0 && io._pending_head >= io._pending.len {
                 io._finish_pass(F);
@@ -1334,7 +1202,6 @@ fn serve<F>(io: Loop&) {
     for k in io._orphans.len { if io._orphans[k].fd >= 0 { c_close(io._orphans[k].fd); io._orphans[k].fd = -1; } }
     c_ring_close(io._ring_fd);
     io._ring_fd = -1;
-    if io._resolver_fd >= 0 { c_resolve_close(io._resolver_fd); io._resolver_fd = -1; }
     if io._attached { qput(_DrainReport { drained: io._stats.closed[6] }); }
 }
 

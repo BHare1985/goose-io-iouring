@@ -1,8 +1,8 @@
-// Runs one part of the conformance suite against the io_uring event loop, on real sockets:
+// Runs one part of the conformance suite against the iouring event loop, on real sockets:
 //
 //     goose build conformance.goose -o conformance && ./conformance <part> <capability>
 //
-// The part is the first argument (default 0) and the capability the second (core, half-close, sizing, abort, inspection, batching or name-resolution;
+// The part is the first argument (default 0) and the capability the second (core, half-close, sizing, abort, inspection or batching;
 // default core). Both ends of every link are on the loop under test, so the runner supplies what a contract call cannot make
 // (docs/event-loops.md, the fixture), without privileges, on the loopback:
 //
@@ -52,12 +52,6 @@ fn main() {
     }
     var capability: u8[>..] = [];
     if arg_count() > 2 { arg(2, capability); }
-    // Optional, for the name-resolution part: the name that has two addresses and the first and second of them, in the order the system gives them
-    // (conformance.sh asks getent), as "ip:80" texts an address of `dial` takes. Without them the checks of the order are skipped.
-    var pair_first:  u8[>..] = [];
-    var pair_second: u8[>..] = [];
-    var pair_name:   u8[>..] = [];
-    if arg_count() > 5 { arg(3, pair_name); arg(4, pair_first); arg(5, pair_second); }
 
     // All four address texts live in one array: the suite is only allowed to call a loop that shrinks its own arrays when the views
     // it holds are of one array exactly (the language's aliasing rule), so the fixture is four slices of one.
@@ -87,15 +81,13 @@ fn main() {
     goose_io::require_sizing(io);
     goose_io::require_abort(io);
     goose_io::require_inspection(io);
-    goose_io::require_name_resolution(io);
     goose_io::require_shared_listen(io);
-    let fixture = goose_io_conformance::Fixture { silent: texts[..silent_end], held: texts[silent_end..held_end], refused: texts[answers_end..], answers: texts[held_end..answers_end], unix: "", found: "localhost", missing: "no-such-name.invalid", pair: pair_name[..], pair_first: pair_first[..], pair_second: pair_second[..] };
+    let fixture = goose_io_conformance::Fixture { silent: texts[..silent_end], held: texts[silent_end..held_end], refused: texts[answers_end..], answers: texts[held_end..answers_end], unix: "" };
     if capability == "half-close" { exit(goose_io_conformance::conformance_half_close_part(io, fixture, part)); }
     if capability == "sizing" { exit(goose_io_conformance::conformance_sizing_part(io, fixture, part)); }
     if capability == "abort" { exit(goose_io_conformance::conformance_abort_part(io, fixture, part)); }
     if capability == "inspection" { exit(goose_io_conformance::conformance_inspection_part(io, fixture, part)); }
     if capability == "shared-listen" { exit(goose_io_conformance::conformance_shared_listen_part(io, fixture, part)); }
-    if capability == "name-resolution" { exit(goose_io_conformance::conformance_name_resolution_part(io, fixture, part)); }
     if capability == "batching" { exit(goose_io_conformance::conformance_batching_part(io, fixture, part)); }
     exit(goose_io_conformance::conformance_core_part(io, fixture, part));
 }

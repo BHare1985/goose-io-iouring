@@ -62,9 +62,3 @@ extern fn c_signal_wait(fd: i32) -> i32;
 
 // CLOCK_BOOTTIME in milliseconds: counts through suspend.
 extern fn c_boottime_ms() -> i64;
-
-// Name lookups (the name-resolution capability): each runs getaddrinfo on a thread; see src/sys.c.
-extern fn c_resolve_open() -> i32;
-extern fn c_resolve_start(rfd: i32, id: u32, host: const u8&, len: i64, port: u16) -> i32;
-extern fn c_resolve_take(rfd: i32, out: u8[136]&) -> i64;
-extern fn c_resolve_close(rfd: i32);
